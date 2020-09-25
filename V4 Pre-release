@@ -1,0 +1,154 @@
+#include "RTClib.h" //v1.3.3
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h> //v1.2.3
+
+#define LCD_ADDR 0x27
+#define LIGHTGATE_CHNL 2                                                              //D2 and D3 are interuptable for Arduino uno
+#define SD_CHIP_CHNL 10                                                               //Standard for HCARDU0093 Data logging shield for ardiuno uno, Slave pin for SPI
+#define SDLOG_SWTCH_CHNL 4
+
+#define AVERAGE_BUFFER_SIZE 10                                                        //running average buffer size
+#define REFRESH_GATES 5                                                               //total 20Gates
+
+LiquidCrystal_I2C Lcd_Pannel = LiquidCrystal_I2C(LCD_ADDR, 16, 2);
+RTC_DS1307 Rtc;
+File MyFile;
+
+int GatePassed = 0;
+int AvrgPlace = 0;
+int refTimeSD = 0;
+
+unsigned int RUNNING_AVRG[AVERAGE_BUFFER_SIZE] = {0};
+unsigned int WindSnelheid, RPM, NextLogging = 0;
+unsigned int AVERAGE_RPM = 0;
+unsigned long PREV_MILLIS;
+
+String THE_FILE;
+bool MENU_NEEDS_UPDATE = true;
+
+String ReturnTimestamp() {                                                            //as format: YYYYMMDDhhmmss from original timestamp_full
+  DateTime time = Rtc.now();
+  String time_stamp = time.timestamp(DateTime::TIMESTAMP_FULL);
+  char timest[20];
+  time_stamp.toCharArray(timest, 20);
+  time_stamp = "";
+  for (char x : timest) {
+    if (isdigit(x)) {                                                                 //avoid all non-digit char's from original timestamp_full
+      time_stamp += x;
+    }
+  }
+  return time_stamp;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();                                                                       //enables I2C and internal pullup for it
+  pinMode(LIGHTGATE_CHNL, INPUT_PULLUP);                                              //Light gate encoder with internal pull-up
+  pinMode(SDLOG_SWTCH_CHNL, INPUT_PULLUP);                                            //SD card logging swtich with internal pull-up
+
+  //-----lcd declaration-----
+  Lcd_Pannel.init();
+  Lcd_Pannel.backlight();
+  Lcd_Pannel.clear();
+
+  //-----SD card Check-----
+  while (!Serial);
+  Serial.print("Initializing SD card...");
+  if (!SD.begin(SD_CHIP_CHNL))
+    Serial.println("initialization failed");
+  else Serial.println("initialization done.");
+
+  //-----Rtc Check-----
+  if (! Rtc.begin()) {
+    Serial.println("Couldn't find Rtc");
+    while (1);
+  }
+  if (! Rtc.isrunning()) {
+    Serial.println("Rtc is NOT running!");
+    Rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));                                   //If not already done, update time with computer time
+  }
+
+  //-----Log File Creation-----
+  DateTime time = Rtc.now();
+  THE_FILE = (String)time.month() + time.day() + time.minute() + time.second() + ".cvs"; //unique data logging name
+  MyFile = SD.open(THE_FILE, FILE_WRITE);
+  MyFile.println(THE_FILE);
+  Serial.println(THE_FILE);
+  MyFile.println(ReturnTimestamp() + "; WindSnelheid ; AVERAGE_RPM");
+  Serial.println(ReturnTimestamp() + "; WindSnelheid ; AVERAGE_RPM");
+
+  MyFile.close();
+
+  //-----Basic Logging values----
+  NextLogging = time.second() + 5;
+  PREV_MILLIS = 0;
+
+  attachInterrupt(digitalPinToInterrupt(LIGHTGATE_CHNL), LightGate, RISING);          //interupt for each time gate is passed
+}
+
+void LcdDisplay() {
+  //-----lcd data printing-----
+  Lcd_Pannel.clear();
+  Lcd_Pannel.setCursor(0, 0);                                                         //Cursor on the first column and first row.
+  Lcd_Pannel.print("RPM:   " + (String)AVERAGE_RPM);
+  Lcd_Pannel.setCursor(0, 1);                                                         //Cursor on the first column and second row.
+  Lcd_Pannel.print("WindV: " + (String)WindSnelheid);
+  MENU_NEEDS_UPDATE = false;
+}
+
+unsigned int AverageRpmCalc() {
+  RUNNING_AVRG[AvrgPlace++] = RPM;                                                    //replace oldest data by newest data in array
+  if (AvrgPlace == AVERAGE_BUFFER_SIZE) {
+    AvrgPlace = 0;
+  }
+  RPM = 0;
+
+  //-----calculate average-----
+  for (int x : RUNNING_AVRG) {                                                        //rpm running average
+    RPM += x;
+  }
+  return (RPM / AVERAGE_BUFFER_SIZE);
+}
+
+void LightGate() {
+  GatePassed++;
+  Serial.println(GatePassed);
+  if (GatePassed >= REFRESH_GATES) {                                                  //calculate RPM over a set of passed gates (aka REFRESH_GATES)
+    unsigned long FastMillisChange = millis();                                        //avoid millis() delay after rpm etc calculation for PREV_MILLIS = millis()
+    MENU_NEEDS_UPDATE = true;
+    RPM = (60000.0 * REFRESH_GATES) / (15 * (FastMillisChange - PREV_MILLIS));
+
+    AVERAGE_RPM = AverageRpmCalc();
+
+    WindSnelheid = 0;                                                                 //temp, still needs a function to convert from rpm
+    PREV_MILLIS = FastMillisChange;                                                   //Data logging numbers reset
+    GatePassed = 0;
+  }
+}
+
+void fileLogging() {
+   if (refTimeSD >= 500) {
+      String sd_upload_data = ReturnTimestamp()                                       //logging data template
+                              + "; " + (String)WindSnelheid 
+                              + "; " + (String)AVERAGE_RPM; 
+      MyFile = SD.open(THE_FILE, FILE_WRITE);                                         //Open active file
+      refTimeSD = 0;                                                                  //Reset active logging timer
+      if (MyFile) {                                                                   //If the file is available, write to it with the logging data
+        MyFile.println(sd_upload_data);
+        MyFile.close();
+      }
+    }
+}
+
+void loop() {
+  refTimeSD++;
+  if (MENU_NEEDS_UPDATE)LcdDisplay();
+  delay(10);
+
+  //-----Logging to SD card every second-----
+  if (digitalRead(SDLOG_SWTCH_CHNL)) {
+   fileLogging();
+  }
+}
